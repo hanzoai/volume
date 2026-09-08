@@ -1,0 +1,410 @@
+//go:build e2e
+
+package test
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kelseyhightower/envconfig"
+	"github.com/stretchr/testify/suite"
+)
+
+const (
+	hostPathVolumeType = "hostPath"
+	localVolumeType    = "local"
+)
+
+type PodTestSuite struct {
+	suite.Suite
+
+	config       testConfig
+	kustomizeDir string
+}
+
+func (p *PodTestSuite) SetupSuite() {
+	err := envconfig.Process("test", &p.config)
+	if err != nil {
+		panic(err)
+	}
+
+	p.T().Logf("using test config: %+v", p.config)
+
+	p.TearDownSuite()
+
+	//kind load docker-image "$image"
+	cmds := []string{
+		fmt.Sprintf("kind create cluster --config=%s --wait=120s", testdataFile("kind-cluster.yaml")),
+		fmt.Sprintf("kind load docker-image %s", p.config.IMAGE),
+	}
+	for _, cmd := range cmds {
+		_, err = runCmd(
+			p.T(),
+			cmd,
+			"",
+			p.config.envs(),
+			nil,
+		)
+		if err != nil {
+			p.FailNow("", "failed to create the cluster or load image", err)
+		}
+	}
+}
+
+func (p *PodTestSuite) TearDownSuite() {
+	err := deleteCluster(
+		p.T(),
+		p.config.envs(),
+	)
+	if err != nil {
+		p.Failf("", "failed to delete the cluster: %v", err)
+	}
+}
+
+func (p *PodTestSuite) TearDownTest() {
+	err := deleteKustomizeDeployment(
+		p.T(),
+		p.kustomizeDir,
+		p.config.envs(),
+	)
+	if err != nil {
+		p.Failf("", "failed to delete the deployment: %v", err)
+	}
+}
+
+func TestPVCTestSuite(t *testing.T) {
+	suite.Run(t, new(PodTestSuite))
+}
+
+func (p *PodTestSuite) TestPodWithHostPathVolume() {
+	p.kustomizeDir = "pod"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithLocalVolume() {
+	p.kustomizeDir = "pod-with-local-volume"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", localVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithLocalVolumeDefault() {
+	p.kustomizeDir = "pod-with-default-local-volume"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", localVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithNodeAffinity() {
+	p.kustomizeDir = "pod-with-node-affinity"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithRWOPVolume() {
+	p.kustomizeDir = "pod-with-rwop-volume"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", localVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithSecurityContext() {
+	p.kustomizeDir = "pod-with-security-context"
+	kustomizeDir := testdataFile(p.kustomizeDir)
+
+	runTest(p, []string{p.config.IMAGE}, "podscheduled", hostPathVolumeType)
+
+	cmd := fmt.Sprintf(`kubectl get pod -l %s=%s -o=jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].reason}'`, LabelKey, LabelValue)
+
+	t := time.Tick(5 * time.Second)
+loop:
+	for {
+		select {
+		case <-t:
+			c := createCmd(p.T(), cmd, kustomizeDir, p.config.envs(), nil)
+			output, err := c.CombinedOutput()
+			if err != nil {
+				p.T().Logf("%s: %v", c.String(), err)
+			}
+
+			if string(output) == "PodCompleted" {
+				break loop
+			}
+
+		case <-time.After(60 * time.Second):
+			p.FailNow("", "pod Ready condition reason should be PodCompleted")
+			break
+		}
+	}
+}
+
+func (p *PodTestSuite) TestPodWithSubpath() {
+	p.kustomizeDir = "pod-with-subpath"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) xxTestPodWithMultipleStorageClasses() {
+	p.kustomizeDir = "multiple-storage-classes"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithCustomNodeAffinityKey() {
+	p.kustomizeDir = "pod-with-custom-node-affinity-key"
+	kustomizeDir := testdataFile(p.kustomizeDir)
+
+	customLabel := "test.example.com/stable-id"
+	customValue := "my-stable-node"
+
+	// Label the kind-worker node with the custom label before deploying
+	labelCmd := fmt.Sprintf("kubectl label node kind-worker %s=%s --overwrite", customLabel, customValue)
+	_, err := runCmd(p.T(), labelCmd, "", p.config.envs(), nil)
+	if err != nil {
+		p.FailNow("", "failed to label node", err)
+	}
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+
+	// Verify the PV was created with the custom node affinity key
+	affinityCmd := `kubectl get pv -o jsonpath='{.items[0].spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key}'`
+	c := createCmd(p.T(), affinityCmd, kustomizeDir, p.config.envs(), nil)
+	output, err := c.CombinedOutput()
+	if err != nil {
+		p.FailNow("", "failed to get PV node affinity key", err)
+	}
+	p.Equal(customLabel, strings.Trim(string(output), "'"), "PV should use the custom node affinity key")
+
+	// Verify the affinity value matches what was set on the node
+	valueCmd := `kubectl get pv -o jsonpath='{.items[0].spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}'`
+	c = createCmd(p.T(), valueCmd, kustomizeDir, p.config.envs(), nil)
+	output, err = c.CombinedOutput()
+	if err != nil {
+		p.FailNow("", "failed to get PV node affinity value", err)
+	}
+	p.Equal(customValue, strings.Trim(string(output), "'"), "PV node affinity value should match the custom label value")
+}
+
+func (p *PodTestSuite) TestPodWithCustomPathPatternStorageClasses() {
+	p.kustomizeDir = "custom-path-pattern"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithSkipPathPatternCheck() {
+	p.kustomizeDir = "skip-path-pattern-check"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+func (p *PodTestSuite) TestPodWithSkipPathPatternCheckByAnnotation() {
+	p.kustomizeDir = "skip-path-pattern-check-by-annotation"
+
+	runTest(p, []string{p.config.IMAGE}, "ready", hostPathVolumeType)
+}
+
+// ADD THIS NEW TEST METHOD
+func (p *PodTestSuite) TestPathTraversalPrevention() {
+	testCases := []struct {
+		name          string
+		kustomizeDir  string
+		expectedError string
+		description   string
+	}{
+		{
+			name:          "BasicDirectoryTraversal",
+			kustomizeDir:  "security-basic-traversal-path",
+			expectedError: "invalid reference",
+			description:   "Basic directory traversal with ../",
+		},
+	}
+
+	for _, tc := range testCases {
+		p.Run(tc.name, func() {
+			p.T().Logf("Testing: %s", tc.description)
+			p.kustomizeDir = tc.kustomizeDir
+			p.verifyProvisioningFailed(tc.expectedError)
+		})
+	}
+}
+
+func (p *PodTestSuite) verifyProvisioningFailed(expectedError string) {
+	kustomizeDir := testdataFile(p.kustomizeDir)
+
+	// Apply the deployment
+	cmds := []string{
+		fmt.Sprintf("kustomize edit add label %s:%s -f", LabelKey, LabelValue),
+		"kustomize build | kubectl apply -f -",
+	}
+
+	for _, cmd := range cmds {
+		_, err := runCmd(p.T(), cmd, kustomizeDir, p.config.envs(), nil)
+		if err != nil {
+			p.FailNow("", "failed to apply deployment", err)
+		}
+	}
+
+	// Wait a bit for provisioning to be attempted
+	time.Sleep(10 * time.Second)
+
+	// Check that PVC is not bound (provisioning should fail)
+	checkPVCCmd := fmt.Sprintf("kubectl get pvc -l %s=%s -o jsonpath='{.items[0].status.phase}'", LabelKey, LabelValue)
+
+	timeout := time.After(30 * time.Second)
+	tick := time.Tick(2 * time.Second)
+
+	for {
+		select {
+		case <-timeout:
+			// Timeout is expected - PVC should remain Pending due to security rejection
+			p.T().Log("PVC correctly remained in Pending state due to security validation")
+			return
+
+		case <-tick:
+			c := createCmd(p.T(), checkPVCCmd, kustomizeDir, p.config.envs(), nil)
+			output, err := c.CombinedOutput()
+			if err != nil {
+				p.T().Logf("PVC check error (expected): %v", err)
+				continue
+			}
+
+			pvcStatus := strings.TrimSpace(string(output))
+			p.T().Logf("PVC Status: %s", pvcStatus)
+
+			if pvcStatus == "Bound" {
+				p.FailNow("", "PVC was bound when it should have been rejected due to security validation")
+			}
+
+			// Check provisioner logs for security error
+			logCmd := `kubectl logs -l app=local-path-provisioner -n local-path-storage --tail=50`
+			logC := createCmd(p.T(), logCmd, kustomizeDir, p.config.envs(), nil)
+			logOutput, logErr := logC.CombinedOutput()
+			if logErr == nil && len(expectedError) > 0 {
+				logStr := string(logOutput)
+				if strings.Contains(logStr, expectedError) || strings.Contains(logStr, "invalid reference") {
+					p.T().Log("Security validation correctly rejected the malicious path pattern")
+					return
+				}
+			}
+		}
+	}
+}
+
+func runTest(p *PodTestSuite, images []string, waitCondition, volumeType string) {
+	kustomizeDir := testdataFile(p.kustomizeDir)
+
+	var cmds []string
+	for _, image := range images {
+		if len(image) > 0 {
+			cmds = append(cmds, fmt.Sprintf("kustomize edit set image ghcr.io/hanzoai/volume=%s", image))
+		}
+	}
+
+	cmds = append(
+		cmds,
+		fmt.Sprintf("kustomize edit add label %s:%s -f", LabelKey, LabelValue),
+		"kustomize build | kubectl apply -f -",
+		fmt.Sprintf("kubectl wait pod -l %s=%s --for condition=%s --timeout=120s", LabelKey, LabelValue, waitCondition),
+	)
+
+	for _, cmd := range cmds {
+		_, err := runCmd(
+			p.T(),
+			cmd,
+			kustomizeDir,
+			p.config.envs(),
+			nil,
+		)
+		if err != nil {
+			p.FailNow("", "failed to run command", cmd, err)
+			break
+		}
+	}
+
+	typeCheckCmd := fmt.Sprintf("kubectl get pv $(%s) -o jsonpath='{.spec.%s}'", "kubectl get pv -o jsonpath='{.items[0].metadata.name}'", volumeType)
+	c := createCmd(p.T(), typeCheckCmd, kustomizeDir, p.config.envs(), nil)
+	typeCheckOutput, err := c.CombinedOutput()
+	if err != nil {
+		p.FailNow("", "failed to check volume type: %v", err)
+	}
+	if len(typeCheckOutput) == 0 || !strings.Contains(string(typeCheckOutput), "path") {
+		p.FailNow("volume Type not correct")
+	}
+}
+
+func testdataFile(fields ...string) string {
+	return filepath.Join("testdata", filepath.Join(fields...))
+}
+
+func deleteKustomizeDeployment(t *testing.T, kustomizeDir string, envs []string) error {
+	_, err := runCmd(
+		t,
+		"kustomize build | kubectl delete --timeout=180s -f -",
+		testdataFile(kustomizeDir),
+		envs,
+		nil,
+	)
+	return err
+}
+
+func deleteCluster(t *testing.T, envs []string) error {
+	_, err := runCmd(
+		t,
+		"kind delete cluster",
+		"",
+		envs,
+		nil,
+	)
+	return err
+}
+
+func createCmd(t *testing.T, cmd, kustomizeDir string, envs []string, callback func(*exec.Cmd)) *exec.Cmd {
+	t.Logf("creating command: %s", cmd)
+	c := exec.Command("bash", "-c", cmd)
+	c.Env = append(os.Environ(), envs...)
+	c.Dir = kustomizeDir
+
+	if callback != nil {
+		callback(c)
+	}
+
+	return c
+}
+
+func runCmd(t *testing.T, cmd, kustomizeDir string, envs []string, callback func(*exec.Cmd)) (*exec.Cmd, error) {
+	t.Logf("running command: %s", cmd)
+
+	c := createCmd(t, cmd, kustomizeDir, envs, callback)
+	stdout, _ := c.StdoutPipe()
+	stderr, _ := c.StderrPipe()
+
+	err := c.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stopCh := make(chan struct{})
+	go func() {
+		mergedReader := io.MultiReader(stderr, stdout)
+		scanner := bufio.NewScanner(mergedReader)
+		scanner.Split(bufio.ScanLines)
+		for scanner.Scan() {
+			t.Log(scanner.Text())
+		}
+
+		close(stopCh)
+	}()
+
+	<-stopCh
+	err = c.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}

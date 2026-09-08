@@ -1,0 +1,20 @@
+{
+	"version": 2,
+	"linters": {
+		"disable-all": true,
+		"enable": [
+			"govet",
+			"misspell",
+			"ineffassign"
+		]
+	},
+	"issues": {
+		"exclude-files": [
+			"/zz_generated_"
+		]
+	},
+	"run": {
+		"tests": true,
+		"timeout": "5m"
+	}
+}

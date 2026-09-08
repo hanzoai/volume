@@ -1,0 +1,16 @@
+Hanzo Volume
+Copyright (c) 2014-present Hanzo AI, Inc.
+
+This product includes software developed by Rancher Labs, Inc.
+
+  local-path-provisioner
+  https://github.com/rancher/local-path-provisioner
+  Copyright (c) 2018-2025 Rancher Labs, Inc.
+  Licensed under the Apache License, Version 2.0.
+
+This work is a derivative of that project at tag v0.0.36. The provisioner's
+behaviour is unchanged; what differs is the name it answers to and the paths an
+operator reads. The Apache-2.0 licence it was published under is the licence
+this carries, unaltered — see LICENSE.
+
+Third-party dependencies are vendored under vendor/ and keep their own licences.

@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hanzo-volume
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hanzo-volume-service-account
+  namespace: hanzo-volume
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hanzo-volume-role
+  namespace: hanzo-volume
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hanzo-volume-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumeclaims", "configmaps", "pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hanzo-volume-bind
+  namespace: hanzo-volume
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hanzo-volume-role
+subjects:
+  - kind: ServiceAccount
+    name: hanzo-volume-service-account
+    namespace: hanzo-volume
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hanzo-volume-bind
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hanzo-volume-role
+subjects:
+  - kind: ServiceAccount
+    name: hanzo-volume-service-account
+    namespace: hanzo-volume
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hanzo-volume
+  namespace: hanzo-volume
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hanzo-volume
+  template:
+    metadata:
+      labels:
+        app: hanzo-volume
+    spec:
+      serviceAccountName: hanzo-volume-service-account
+      containers:
+        - name: hanzo-volume
+          image: ghcr.io/hanzoai/volume:v0.0.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - hanzo-volume
+            - --debug
+            - start
+            - --config
+            - /etc/config/config.json
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config/
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CONFIG_MOUNT_PATH
+              value: /etc/config/
+      volumes:
+        - name: config-volume
+          configMap:
+            name: hanzo-volume-config
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+provisioner: hanzo.ai/volume
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: hanzo-volume-config
+  namespace: hanzo-volume
+data:
+  config.json: |-
+    {
+            "nodePathMap":[
+            {
+                    "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+                    "paths":["/var/lib/hanzo/volume"]
+            }
+            ]
+    }
+  setup: |-
+    #!/bin/sh
+    set -eu
+    mkdir -m 0777 -p "$VOL_DIR"
+  teardown: |-
+    #!/bin/sh
+    set -eu
+    rm -rf "$VOL_DIR"
+  helperPod.yaml: |-
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+      containers:
+      - name: helper-pod
+        image: docker.io/library/busybox
+        imagePullPolicy: IfNotPresent

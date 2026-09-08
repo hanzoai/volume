@@ -1,0 +1,23 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: local-path-config
+  namespace: local-path-storage
+data:
+  config.json: |-
+    {
+            "storageClassConfigs":{
+                   "local-path": {
+                          "nodePathMap": [
+                          {
+                                  "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+                                  "paths":["/var/lib/hanzo/volume"]
+                          }
+                          ]
+                   },
+                   "local-path-shared": {
+                          "sharedFilesystemPath": "/var/lib/hanzo/volume-shared"
+                   }
+            }
+    }
+

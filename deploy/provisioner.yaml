@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hanzo-volume
+  namespace: hanzo-volume
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hanzo-volume
+  template:
+    metadata:
+      labels:
+        app: hanzo-volume
+    spec:
+      serviceAccountName: hanzo-volume-service-account
+      containers:
+        - name: hanzo-volume
+          image: ghcr.io/hanzoai/volume:v0.0.36
+          imagePullPolicy: Always
+          command:
+            - hanzo-volume
+            - --debug
+            - start
+            - --config
+            - /etc/config/config.json
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config/
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      volumes:
+        - name: config-volume
+          configMap:
+            name: hanzo-volume-config

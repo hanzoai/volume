@@ -1,0 +1,9 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: security-test-storage
+provisioner: hanzo.ai/volume
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+parameters:
+  pathPattern: "{{ .PVC.Name }}/../../../etc/passwd"
