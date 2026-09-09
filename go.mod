@@ -1,6 +1,6 @@
 module github.com/hanzoai/volume
 
-go 1.26.3
+go 1.26.8
 
 require (
 	github.com/kelseyhightower/envconfig v1.4.0
